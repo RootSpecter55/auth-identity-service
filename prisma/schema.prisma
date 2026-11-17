@@ -1,0 +1,184 @@
+generator client {
+  provider            = "prisma-client"
+  output              = "../src/generated/prisma"
+  moduleFormat        = "cjs"
+  importFileExtension = ""
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum RefreshTokenStatus {
+  ACTIVE
+  ROTATED
+  REVOKED
+}
+
+enum KeyStatus {
+  ACTIVE
+  RETIRED
+}
+
+enum TotpStatus {
+  PENDING
+  ACTIVE
+}
+
+enum EmailTokenPurpose {
+  VERIFY_EMAIL
+  RESET_PASSWORD
+}
+
+model User {
+  id              String         @id @default(uuid()) @db.Uuid
+  email           String         @unique
+  name            String
+  passwordHash    String         @map("password_hash")
+  emailVerifiedAt DateTime?      @map("email_verified_at") @db.Timestamptz(3)
+  disabledAt      DateTime?      @map("disabled_at") @db.Timestamptz(3)
+  createdAt       DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
+  roles           UserRole[]
+  sessions        Session[]
+  totp            TotpFactor?
+  recoveryCodes   RecoveryCode[]
+  mfaChallenges   MfaChallenge[]
+  emailTokens     EmailToken[]
+
+  @@map("users")
+}
+
+model Role {
+  id          String     @id @default(uuid()) @db.Uuid
+  name        String     @unique
+  description String     @default("")
+  createdAt   DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+  users       UserRole[]
+
+  @@map("roles")
+}
+
+model UserRole {
+  userId    String   @map("user_id") @db.Uuid
+  roleId    String   @map("role_id") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role      Role     @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([userId, roleId])
+  @@map("user_roles")
+}
+
+/// One login. Its refresh tokens form a family: reuse of a rotated one revokes the whole session.
+model Session {
+  id            String         @id @default(uuid()) @db.Uuid
+  userId        String         @map("user_id") @db.Uuid
+  userAgent     String?        @map("user_agent")
+  ipAddress     String?        @map("ip_address")
+  createdAt     DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  lastUsedAt    DateTime       @default(now()) @map("last_used_at") @db.Timestamptz(3)
+  expiresAt     DateTime       @map("expires_at") @db.Timestamptz(3)
+  revokedAt     DateTime?      @map("revoked_at") @db.Timestamptz(3)
+  revokedReason String?        @map("revoked_reason")
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  refreshTokens RefreshToken[]
+
+  @@index([userId, createdAt])
+  @@map("sessions")
+}
+
+model RefreshToken {
+  id        String             @id @default(uuid()) @db.Uuid
+  sessionId String             @map("session_id") @db.Uuid
+  /// SHA-256 of the opaque token. The token itself is only ever in the client's hands.
+  tokenHash String             @unique @map("token_hash")
+  status    RefreshTokenStatus @default(ACTIVE)
+  expiresAt DateTime           @map("expires_at") @db.Timestamptz(3)
+  createdAt DateTime           @default(now()) @map("created_at") @db.Timestamptz(3)
+  usedAt    DateTime?          @map("used_at") @db.Timestamptz(3)
+  session   Session            @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId])
+  @@map("refresh_tokens")
+}
+
+/// The id is the JWT `kid`. The private half lives in the KeyStore; privateKeyRef points to it.
+model SigningKey {
+  id            String    @id
+  publicJwk     Json      @map("public_jwk")
+  privateKeyRef String    @map("private_key_ref")
+  keyStore      String    @map("key_store")
+  status        KeyStatus
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  retiredAt     DateTime? @map("retired_at") @db.Timestamptz(3)
+  /// A retired key stays in the JWKS until every token it signed has expired.
+  publishUntil  DateTime? @map("publish_until") @db.Timestamptz(3)
+
+  @@map("signing_keys")
+}
+
+model TotpFactor {
+  id              String     @id @default(uuid()) @db.Uuid
+  userId          String     @unique @map("user_id") @db.Uuid
+  /// AES-256-GCM encrypted with KEY_ENCRYPTION_KEY.
+  secretEncrypted String     @map("secret_encrypted")
+  status          TotpStatus @default(PENDING)
+  /// Highest 30-second step accepted so far; a code for this step or earlier is a replay.
+  lastUsedStep    Int?       @map("last_used_step")
+  createdAt       DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+  activatedAt     DateTime?  @map("activated_at") @db.Timestamptz(3)
+  user            User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("totp_factors")
+}
+
+model RecoveryCode {
+  id       String    @id @default(uuid()) @db.Uuid
+  userId   String    @map("user_id") @db.Uuid
+  codeHash String    @map("code_hash")
+  usedAt   DateTime? @map("used_at") @db.Timestamptz(3)
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("recovery_codes")
+}
+
+/// Issued after a correct password when MFA is on; exchanged for tokens with a valid code.
+model MfaChallenge {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  tokenHash String    @unique @map("token_hash")
+  attempts  Int       @default(0)
+  expiresAt DateTime  @map("expires_at") @db.Timestamptz(3)
+  usedAt    DateTime? @map("used_at") @db.Timestamptz(3)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("mfa_challenges")
+}
+
+model EmailToken {
+  id        String            @id @default(uuid()) @db.Uuid
+  userId    String            @map("user_id") @db.Uuid
+  purpose   EmailTokenPurpose
+  tokenHash String            @unique @map("token_hash")
+  expiresAt DateTime          @map("expires_at") @db.Timestamptz(3)
+  usedAt    DateTime?         @map("used_at") @db.Timestamptz(3)
+  createdAt DateTime          @default(now()) @map("created_at") @db.Timestamptz(3)
+  user      User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, purpose])
+  @@map("email_tokens")
+}
+
+/// Mail "sent" by the fake email provider. Readable through GET /dev/emails in development.
+model DevEmail {
+  id        String   @id @default(uuid()) @db.Uuid
+  to        String
+  subject   String
+  text      String
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([to, createdAt])
+  @@map("dev_emails")
+}
