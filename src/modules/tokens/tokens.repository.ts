@@ -16,12 +16,25 @@ export class SigningKeyRepository extends BaseRepository<
     return db.signingKey.findFirst({ where: { status: 'ACTIVE' } });
   }
 
-  /** The keys that belong in the JWKS: the active key, plus retired keys still in their window. */
+  findNext(db: Db) {
+    return db.signingKey.findFirst({ where: { status: 'NEXT' } });
+  }
+
+  /** The keys that belong in the JWKS: next, active, and retired ones still in their window. */
   findPublished(db: Db, now: Date) {
     return db.signingKey.findMany({
-      where: { OR: [{ status: 'ACTIVE' }, { status: 'RETIRED', publishUntil: { gt: now } }] },
+      where: {
+        OR: [
+          { status: { in: ['NEXT', 'ACTIVE'] } },
+          { status: 'RETIRED', publishUntil: { gt: now } },
+        ],
+      },
       orderBy: { createdAt: 'desc' },
     });
+  }
+
+  async promote(db: Db, id: string): Promise<void> {
+    await db.signingKey.update({ where: { id }, data: { status: 'ACTIVE' } });
   }
 
   async retire(db: Db, id: string, retiredAt: Date, publishUntil: Date): Promise<void> {

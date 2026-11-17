@@ -15,7 +15,10 @@ enum RefreshTokenStatus {
   REVOKED
 }
 
+/// NEXT: published but not signing yet, so every JWKS cache has it before it is used.
+/// ACTIVE: signs new tokens. RETIRED: published until the tokens it signed have expired.
 enum KeyStatus {
+  NEXT
   ACTIVE
   RETIRED
 }

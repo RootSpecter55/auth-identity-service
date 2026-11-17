@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { decodeProtectedHeader, importJWK, jwtVerify, type JWK, type JWTPayload } from 'jose';
-import type { DbContext } from '../../common/db';
+import type { Db, DbContext } from '../../common/db';
 import { isUniqueViolation } from '../../common/db';
 import { UnauthorizedError } from '../../common/errors';
 import { toPage, toSkipTake, type PaginationQuery } from '../../common/pagination';
@@ -46,29 +46,41 @@ export class TokensService {
     private readonly options: TokenOptions,
   ) {}
 
-  /** The active key; on a fresh database the first one is created. */
-  private async activeKey(): Promise<SigningKey> {
-    const active = await this.keys.findActive(this.db.client());
-    if (active) return active;
+  /** Creates a key row in the given state, with its private half in the KeyStore. */
+  private async createKey(db: Db, status: 'NEXT' | 'ACTIVE'): Promise<SigningKey> {
     const { publicJwk, privateKeyRef } = await this.keyStore.createKey();
-    try {
-      return await this.keys.create(this.db.client(), {
-        id: randomUUID(),
-        publicJwk,
-        privateKeyRef,
-        keyStore: this.keyStore.name,
-        status: 'ACTIVE',
-      });
-    } catch (err) {
-      // Another instance created the first key at the same moment: the partial unique index
-      // allows one ACTIVE key, so use theirs.
-      if (!isUniqueViolation(err)) throw err;
-      return (await this.keys.findActive(this.db.client()))!;
-    }
+    return this.keys.create(db, {
+      id: randomUUID(),
+      publicJwk,
+      privateKeyRef,
+      keyStore: this.keyStore.name,
+      status,
+    });
+  }
+
+  /**
+   * Makes sure an ACTIVE and a NEXT key exist (on a fresh database, the first call creates
+   * them). If another instance creates one at the same moment, the partial unique indexes let
+   * only one win, and this instance uses that one.
+   */
+  private async ensureKeys(): Promise<{ active: SigningKey; next: SigningKey }> {
+    const db = this.db.client();
+    const ensure = async (status: 'NEXT' | 'ACTIVE') => {
+      const find = () => (status === 'ACTIVE' ? this.keys.findActive(db) : this.keys.findNext(db));
+      const existing = await find();
+      if (existing) return existing;
+      try {
+        return await this.createKey(db, status);
+      } catch (err) {
+        if (!isUniqueViolation(err)) throw err;
+        return (await find())!;
+      }
+    };
+    return { active: await ensure('ACTIVE'), next: await ensure('NEXT') };
   }
 
   async issueAccessToken(claims: AccessTokenClaims): Promise<{ token: string; expiresIn: number }> {
-    const key = await this.activeKey();
+    const { active: key } = await this.ensureKeys();
     const now = Math.floor(Date.now() / 1000);
     const ttl = this.options.accessTokenTtlSeconds;
     const header = { alg: 'ES256', typ: 'JWT', kid: key.id };
@@ -112,35 +124,50 @@ export class TokensService {
     this.publicKeys = new Map(published.map((key) => [key.id, toJwk(key)]));
   }
 
-  /** The JWKS document: every key a valid, unexpired token could have been signed with. */
+  /**
+   * The JWKS document: every key a valid, unexpired token could have been signed with, plus
+   * the NEXT key, published ahead of time so caches already hold it when it starts signing.
+   */
   async jwks() {
-    await this.activeKey();
+    await this.ensureKeys();
     const published = await this.keys.findPublished(this.db.client(), new Date());
     return { keys: published.map(toJwk) };
   }
 
   /**
-   * Starts signing with a new key. The old key is retired but stays published until every
-   * token it signed has expired (now + access-token TTL + clock skew).
+   * Rotation, in one transaction: ACTIVE -> RETIRED, NEXT -> ACTIVE, and a new NEXT.
+   *
+   * The key that starts signing has been in the JWKS since the previous rotation, so resource
+   * servers have it cached already. (JWKS clients rate-limit refetches; jose waits 30 s by
+   * default, so a key published at the moment it starts signing would be rejected for a while.)
+   * The retired key stays published until every token it signed has expired: now + access-token
+   * TTL + clock skew.
    */
   async rotate() {
-    const previous = await this.activeKey();
+    const { active, next } = await this.ensureKeys();
     const { publicJwk, privateKeyRef } = await this.keyStore.createKey();
     const now = new Date();
     const publishUntil = new Date(
       now.getTime() + (this.options.accessTokenTtlSeconds + CLOCK_SKEW_SECONDS) * 1000,
     );
-    const next = await this.db.transaction(async (tx) => {
-      await this.keys.retire(tx, previous.id, now, publishUntil);
+    const upcoming = await this.db.transaction(async (tx) => {
+      await this.keys.retire(tx, active.id, now, publishUntil);
+      await this.keys.promote(tx, next.id);
       return this.keys.create(tx, {
         id: randomUUID(),
         publicJwk,
         privateKeyRef,
         keyStore: this.keyStore.name,
-        status: 'ACTIVE',
+        status: 'NEXT',
       });
     });
-    return { kid: next.id, previousKid: previous.id, previousPublishedUntil: publishUntil };
+    this.publicKeys.clear();
+    return {
+      kid: next.id,
+      nextKid: upcoming.id,
+      previousKid: active.id,
+      previousPublishedUntil: publishUntil,
+    };
   }
 
   async listKeys(query: PaginationQuery) {
